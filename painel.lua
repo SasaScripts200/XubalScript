@@ -1,5 +1,5 @@
 --[[
-    Painel simples: Velocidade | Vida | NoClip
+    Painel: Velocidade | Vida | NoClip | Voar ao pegar item
     Uso (executor):
         loadstring(game:HttpGet("SEU_LINK_RAW_AQUI"))()
 ]]
@@ -15,8 +15,11 @@ local GUI_NAME = "PainelFuncoes"
 -- Estado
 ---------------------------------------------------------------------
 local state = {
-    speed = nil,      -- velocidade personalizada (nil = não alterar)
+    speed = nil,        -- velocidade personalizada (nil = não alterar)
+    health = nil,       -- vida máxima personalizada (nil = não alterar)
     noclip = false,
+    flyOnPickup = false,
+    flyHeight = 100,    -- altura (studs) do impulso ao pegar item
 }
 local connections = {}
 
@@ -31,6 +34,11 @@ end
 local function getHumanoid()
     local char = player.Character
     return char and char:FindFirstChildOfClass("Humanoid")
+end
+
+local function getRoot()
+    local char = player.Character
+    return char and char:FindFirstChild("HumanoidRootPart")
 end
 
 local function getGuiParent()
@@ -68,11 +76,29 @@ local function applySpeed(value)
     end
 end
 
+-- Procura o Humanoid e a propriedade MaxHealth (usado na etapa de "carregando")
+-- Retorna o MaxHealth atual, ou nil se não achar
+local function findMaxHealth()
+    local char = player.Character or player.CharacterAdded:Wait()
+    local hum = char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid", 5)
+    if not hum then
+        return nil
+    end
+    local ok, value = pcall(function()
+        return hum.MaxHealth
+    end)
+    if ok then
+        return value
+    end
+    return nil
+end
+
 local function applyHealth(value)
+    state.health = value
     local hum = getHumanoid()
     if hum then
-        hum.MaxHealth = value
-        hum.Health = value
+        hum.MaxHealth = value -- primeiro aumenta o limite...
+        hum.Health = value    -- ...depois enche a vida
     end
 end
 
@@ -80,7 +106,7 @@ local function setNoclip(enabled)
     state.noclip = enabled
 end
 
--- Mantém a velocidade (alguns jogos tentam resetar) e aplica NoClip
+-- Loop: NoClip + manter velocidade e vida máxima
 track(RunService.Stepped:Connect(function()
     local char = player.Character
     if not char then
@@ -95,20 +121,92 @@ track(RunService.Stepped:Connect(function()
         end
     end
 
-    if state.speed then
-        local hum = char:FindFirstChildOfClass("Humanoid")
-        if hum and hum.WalkSpeed ~= state.speed then
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if hum then
+        if state.speed and hum.WalkSpeed ~= state.speed then
             hum.WalkSpeed = state.speed
+        end
+        if state.health and hum.MaxHealth ~= state.health then
+            hum.MaxHealth = state.health
         end
     end
 end))
 
--- Reaplica a velocidade ao renascer
-track(player.CharacterAdded:Connect(function(char)
-    local hum = char:WaitForChild("Humanoid", 10)
-    if hum and state.speed then
-        hum.WalkSpeed = state.speed
+---------------------------------------------------------------------
+-- Voar ao pegar item (Tool entrando na Backpack)
+---------------------------------------------------------------------
+local knownTools = setmetatable({}, { __mode = "k" }) -- ferramentas já vistas
+local ignoreUntil = 0 -- ignora itens iniciais logo após renascer
+local backpackConn
+
+local function launchUp()
+    local root = getRoot()
+    if not root then
+        return
     end
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.CFrame = root.CFrame + Vector3.new(0, state.flyHeight, 0)
+end
+
+local function watchBackpack(backpack)
+    if backpackConn then
+        backpackConn:Disconnect()
+    end
+
+    -- Marca o que já existe como "conhecido"
+    for _, item in ipairs(backpack:GetChildren()) do
+        knownTools[item] = true
+    end
+    if player.Character then
+        for _, item in ipairs(player.Character:GetChildren()) do
+            if item:IsA("Tool") then
+                knownTools[item] = true
+            end
+        end
+    end
+
+    backpackConn = backpack.ChildAdded:Connect(function(item)
+        if not item:IsA("Tool") then
+            return
+        end
+        -- Se já era conhecido (ex.: desequipou o item), não é um "pegar"
+        if knownTools[item] then
+            return
+        end
+        knownTools[item] = true
+
+        if state.flyOnPickup and os.clock() > ignoreUntil then
+            launchUp()
+        end
+    end)
+    track(backpackConn)
+end
+
+local function setupBackpack()
+    local backpack = player:FindFirstChildOfClass("Backpack") or player:WaitForChild("Backpack", 10)
+    if backpack then
+        watchBackpack(backpack)
+    end
+end
+
+task.spawn(setupBackpack)
+
+-- Ao renascer: reaplica velocidade/vida e religa a observação da Backpack
+track(player.CharacterAdded:Connect(function(char)
+    ignoreUntil = os.clock() + 3 -- itens iniciais do spawn não contam
+
+    local hum = char:WaitForChild("Humanoid", 10)
+    if hum then
+        if state.speed then
+            hum.WalkSpeed = state.speed
+        end
+        if state.health then
+            hum.MaxHealth = state.health
+            hum.Health = state.health
+        end
+    end
+
+    setupBackpack()
 end))
 
 ---------------------------------------------------------------------
@@ -190,6 +288,8 @@ corner(closeBtn, 6)
 closeBtn.MouseButton1Click:Connect(function()
     state.noclip = false
     state.speed = nil
+    state.health = nil
+    state.flyOnPickup = false
     for _, c in ipairs(connections) do
         c:Disconnect()
     end
@@ -241,10 +341,7 @@ local function makeButton(text, order)
     return btn
 end
 
--- Cria um botão que, ao clicar, mostra/oculta uma caixa de texto logo abaixo
-local function makeInputSection(label, placeholder, order, onApply)
-    local btn = makeButton(label, order)
-
+local function makeBox(placeholder, order)
     local box = Instance.new("TextBox")
     box.Size = UDim2.new(1, 0, 0, 32)
     box.BackgroundColor3 = COLORS.box
@@ -256,16 +353,76 @@ local function makeInputSection(label, placeholder, order, onApply)
     box.TextSize = 14
     box.ClearTextOnFocus = false
     box.Visible = false
-    box.LayoutOrder = order + 1 -- fica logo abaixo do botão
+    box.LayoutOrder = order
     box.Parent = main
     corner(box, 8)
+    return box
+end
+
+-- Botão que mostra/oculta uma caixa de texto logo abaixo.
+-- prepare (opcional): função que roda ANTES de mostrar a caixa, com uma
+-- etapa de "carregando". Deve retornar o novo placeholder (ou nil se falhar).
+local function makeInputSection(label, placeholder, order, onApply, prepare)
+    local btn = makeButton(label, order)
+    local box = makeBox(placeholder, order + 1) -- fica logo abaixo do botão
+    local busy = false
+
+    local function showBox(text)
+        if text then
+            box.PlaceholderText = text
+        end
+        box.Visible = true
+        btn.Text = label
+        btn.BackgroundColor3 = COLORS.accent
+        box:CaptureFocus()
+    end
 
     btn.MouseButton1Click:Connect(function()
-        box.Visible = not box.Visible
-        btn.BackgroundColor3 = box.Visible and COLORS.accent or COLORS.button
-        if box.Visible then
-            box:CaptureFocus()
+        if busy then
+            return
         end
+
+        -- Se já está aberta, fecha
+        if box.Visible then
+            box.Visible = false
+            btn.BackgroundColor3 = COLORS.button
+            return
+        end
+
+        if not prepare then
+            showBox()
+            return
+        end
+
+        -- Etapa de carregamento antes de mostrar a caixa
+        busy = true
+        task.spawn(function()
+            local dots = 0
+            local loading = true
+
+            task.spawn(function()
+                while loading do
+                    dots = (dots % 3) + 1
+                    btn.Text = "Procurando propriedade" .. string.rep(".", dots)
+                    task.wait(0.3)
+                end
+            end)
+
+            task.wait(1) -- pequena pausa para o efeito de carregamento
+            local result = prepare()
+            loading = false
+
+            if result then
+                showBox(result)
+            else
+                btn.Text = "Não encontrado :("
+                btn.BackgroundColor3 = COLORS.error
+                task.wait(1.5)
+                btn.Text = label
+                btn.BackgroundColor3 = COLORS.button
+            end
+            busy = false
+        end)
     end)
 
     box.FocusLost:Connect(function()
@@ -279,13 +436,42 @@ local function makeInputSection(label, placeholder, order, onApply)
     end)
 end
 
--- Ordens: botão = 10 / 20 (caixa = 11 / 21), NoClip = 30
+-- Ordens: cada seção usa dois números (botão = n, caixa = n + 1)
 makeInputSection("Aumentar velocidade", "Velocidade (padrão: 16)", 10, applySpeed)
-makeInputSection("Aumentar vida", "Vida (padrão: 100)", 20, applyHealth)
 
+makeInputSection("Aumentar vida", "Vida (padrão: 100)", 20, applyHealth, function()
+    local current = findMaxHealth()
+    if current then
+        return "Vida máxima (atual: " .. tostring(math.floor(current)) .. ")"
+    end
+    return nil
+end)
+
+-- NoClip (ativa só de clicar)
 local noclipBtn = makeButton("NoClip: OFF", 30)
 noclipBtn.MouseButton1Click:Connect(function()
     setNoclip(not state.noclip)
     noclipBtn.Text = state.noclip and "NoClip: ON" or "NoClip: OFF"
     noclipBtn.BackgroundColor3 = state.noclip and COLORS.buttonOn or COLORS.button
+end)
+
+-- Voar ao pegar item (ativável) + caixa opcional para a altura
+local flyBtn = makeButton("Voar ao pegar item: OFF", 40)
+local flyBox = makeBox("Altura em studs (padrão: 100)", 41)
+
+flyBtn.MouseButton1Click:Connect(function()
+    state.flyOnPickup = not state.flyOnPickup
+    flyBtn.Text = state.flyOnPickup and "Voar ao pegar item: ON" or "Voar ao pegar item: OFF"
+    flyBtn.BackgroundColor3 = state.flyOnPickup and COLORS.buttonOn or COLORS.button
+    flyBox.Visible = state.flyOnPickup
+end)
+
+flyBox.FocusLost:Connect(function()
+    local value = tonumber(flyBox.Text)
+    if value and value > 0 then
+        state.flyHeight = value
+    elseif flyBox.Text ~= "" then
+        flyBox.Text = ""
+        flyBox.PlaceholderText = "Digite um número válido"
+    end
 end)
