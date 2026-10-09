@@ -1,0 +1,2 @@
+# XubalScript
+Script Luau
